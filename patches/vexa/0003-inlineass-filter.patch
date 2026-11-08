@@ -1,0 +1,577 @@
+diff --git a/configure b/configure
+index daae3e3..eaf23e7 100755
+--- a/configure
++++ b/configure
+@@ -4254,6 +4254,7 @@ spp_filter_select="idctdsp fdctdsp pixblockdsp"
+ sr_filter_deps="avformat swscale"
+ sr_filter_select="dnn"
+ stereo3d_filter_deps="gpl"
++inlineass_filter_deps="libass"
+ subtitles_filter_deps="avformat avcodec libass"
+ super2xsai_filter_deps="gpl"
+ pixfmts_super2xsai_test_deps="super2xsai_filter"
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index de6e067..45641ec 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -541,6 +541,7 @@ OBJS-$(CONFIG_SSIM360_FILTER)                += vf_ssim360.o framesync.o
+ OBJS-$(CONFIG_STEREO3D_FILTER)               += vf_stereo3d.o
+ OBJS-$(CONFIG_STREAMSELECT_FILTER)           += f_streamselect.o framesync.o
+ OBJS-$(CONFIG_SUBTITLES_FILTER)              += vf_subtitles.o
++OBJS-$(CONFIG_INLINEASS_FILTER)              += vf_inlineass.o
+ OBJS-$(CONFIG_SUPER2XSAI_FILTER)             += vf_super2xsai.o
+ OBJS-$(CONFIG_SWAPRECT_FILTER)               += vf_swaprect.o
+ OBJS-$(CONFIG_SWAPUV_FILTER)                 += vf_swapuv.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 3442269..dc4b6a7 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -501,6 +501,7 @@ extern const FFFilter ff_vf_ssim360;
+ extern const FFFilter ff_vf_stereo3d;
+ extern const FFFilter ff_vf_streamselect;
+ extern const FFFilter ff_vf_subtitles;
++extern const FFFilter ff_vf_inlineass;
+ extern const FFFilter ff_vf_super2xsai;
+ extern const FFFilter ff_vf_swaprect;
+ extern const FFFilter ff_vf_swapuv;
+diff --git a/libavfilter/vf_inlineass.c b/libavfilter/vf_inlineass.c
+new file mode 100644
+index 0000000..ee9c9eb
+--- /dev/null
++++ b/libavfilter/vf_inlineass.c
+@@ -0,0 +1,492 @@
++/*
++ * Burn a subtitle stream decoded by the ffmpeg tool onto the video, with libass.
++ * Rendering follows vf_subtitles.c.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <string.h>
++
++#include <ass/ass.h>
++
++#include "libavutil/avstring.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++#include "libavutil/thread.h"
++
++#include "avfilter.h"
++#include "drawutils.h"
++#include "filters.h"
++#include "formats.h"
++#include "video.h"
++#include "vf_inlineass.h"
++
++/* ---- sources: what the ffmpeg tool decoded, shared by every filter instance ---- */
++
++typedef struct InlineAssEvent {
++    char   *line;          // ASS "Dialogue" payload as produced by the decoders
++    int64_t start, duration;   // ms
++} InlineAssEvent;
++
++typedef struct InlineAssSource {
++    int file_index, stream_index;
++    enum AVCodecID codec_id;
++    uint8_t *header;       // codec private / ASS header, once known
++    int header_size;
++    int have_header;
++    InlineAssEvent *events;
++    int nb_events;
++} InlineAssSource;
++
++typedef struct InlineAssFont {
++    char *name;
++    uint8_t *data;
++    int size;
++} InlineAssFont;
++
++static AVMutex          sources_lock = AV_MUTEX_INITIALIZER;
++static InlineAssSource *sources;
++static int              nb_sources;
++static InlineAssFont   *fonts;
++static int              nb_fonts;
++
++int avfilter_inlineass_add_source(int file_index, int stream_index)
++{
++    InlineAssSource *s;
++    int id;
++    ff_mutex_lock(&sources_lock);
++    s = av_realloc_array(sources, nb_sources + 1, sizeof(*sources));
++    if (!s) {
++        ff_mutex_unlock(&sources_lock);
++        return AVERROR(ENOMEM);
++    }
++    sources = s;
++    id = nb_sources++;
++    memset(&sources[id], 0, sizeof(sources[id]));
++    sources[id].file_index   = file_index;
++    sources[id].stream_index = stream_index;
++    ff_mutex_unlock(&sources_lock);
++    return id;
++}
++
++int avfilter_inlineass_find_source(int file_index, int stream_index)
++{
++    int id = -1;
++    ff_mutex_lock(&sources_lock);
++    for (int i = 0; i < nb_sources && id < 0; i++)
++        if (sources[i].file_index == file_index && sources[i].stream_index == stream_index)
++            id = i;
++    ff_mutex_unlock(&sources_lock);
++    return id;
++}
++
++void avfilter_inlineass_add_font(const char *name, const uint8_t *data, int size)
++{
++    InlineAssFont *f;
++    ff_mutex_lock(&sources_lock);
++    f = av_realloc_array(fonts, nb_fonts + 1, sizeof(*fonts));
++    if (f) {
++        fonts = f;
++        f = &fonts[nb_fonts];
++        f->name = av_strdup(name);
++        f->data = av_memdup(data, size);
++        f->size = size;
++        if (f->name && f->data)
++            nb_fonts++;
++        else {
++            av_freep(&f->name);
++            av_freep(&f->data);
++        }
++    }
++    ff_mutex_unlock(&sources_lock);
++}
++
++void avfilter_inlineass_append(int source, const AVCodecContext *dec, const AVSubtitle *sub)
++{
++    InlineAssSource *s;
++    ff_mutex_lock(&sources_lock);
++    if (source < 0 || source >= nb_sources)
++        goto end;
++    s = &sources[source];
++    if (!s->have_header) {
++        const uint8_t *h = dec->subtitle_header ? dec->subtitle_header : dec->extradata;
++        int size         = dec->subtitle_header ? dec->subtitle_header_size : dec->extradata_size;
++        s->codec_id = dec->codec_id;
++        if (h && size > 0) {
++            s->header = av_memdup(h, size);
++            s->header_size = s->header ? size : 0;
++        }
++        s->have_header = 1;
++    }
++    for (unsigned i = 0; i < sub->num_rects; i++) {
++        InlineAssEvent *e;
++        if (!sub->rects[i]->ass)
++            break;
++        e = av_realloc_array(s->events, s->nb_events + 1, sizeof(*s->events));
++        if (!e)
++            break;
++        s->events = e;
++        e = &s->events[s->nb_events];
++        e->line     = av_strdup(sub->rects[i]->ass);
++        e->start    = av_rescale_q(sub->pts, AV_TIME_BASE_Q, av_make_q(1, 1000)) + sub->start_display_time;
++        e->duration = (int64_t)sub->end_display_time - sub->start_display_time;
++        if (e->line)
++            s->nb_events++;
++    }
++end:
++    ff_mutex_unlock(&sources_lock);
++}
++
++/* ---- the filter ---- */
++
++typedef struct InlineAssContext {
++    const AVClass *class;
++    ASS_Library  *library;
++    ASS_Renderer *renderer;
++    ASS_Track    *track;
++    FFDrawContext draw;
++
++    int    source;
++    char  *font_path;
++    char  *font_name;
++    char  *fonts_dir;
++    char  *fc_file;
++    char  *language;
++    char  *overrides;
++    int    apply_overrides;
++    double font_scale;
++    double font_size;      // sizes are in pixels of a 720-line picture, scaled to the track's PlayResY
++    double outline;
++    double shadow;
++    double margin_h;
++    double margin_v;
++
++    int draw_ready;        // 0: not set up, 1: before the track header, 2: with the header's YCbCr matrix
++    int got_header;
++    int nb_events_seen;
++    int nb_fonts_seen;
++    int fonts_set;
++} InlineAssContext;
++
++#define OFFSET(x) offsetof(InlineAssContext, x)
++#define FLAGS AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM
++
++static const AVOption inlineass_options[] = {
++    { "source",          "which -map_inlineass stream to burn",  OFFSET(source),          AV_OPT_TYPE_INT,    { .i64 = 0 },    0, INT_MAX, FLAGS },
++    { "font_scale",      "font scale factor",                    OFFSET(font_scale),      AV_OPT_TYPE_DOUBLE, { .dbl = 1.0 },  0, 100,     FLAGS },
++    { "font_path",       "path to default font",                 OFFSET(font_path),       AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0,       FLAGS },
++    { "font_name",       "name of default font",                 OFFSET(font_name),       AV_OPT_TYPE_STRING, { .str = "Noto Sans Medium" }, 0, 0, FLAGS },
++    { "overrides",       "style overrides",                      OFFSET(overrides),       AV_OPT_TYPE_STRING,
++      { .str = "ScaledBorderAndShadow=yes,FontName=Noto Sans Medium,Bold=500,PrimaryColour=&H00FFFFFF,OutlineColour=&H00020713,BackColour=&HCC000000" }, 0, 0, FLAGS },
++    { "apply_overrides", "whether to apply style overrides (-1: not to ASS subtitles)", OFFSET(apply_overrides), AV_OPT_TYPE_BOOL, { .i64 = -1 }, -1, 1, FLAGS },
++    { "font_size",       "default font size",                    OFFSET(font_size),       AV_OPT_TYPE_DOUBLE, { .dbl = 54.0 }, 0, 100,     FLAGS },
++    { "outline",         "default outline thickness",            OFFSET(outline),         AV_OPT_TYPE_DOUBLE, { .dbl = 2.6 },  0, 100,     FLAGS },
++    { "shadow",          "default shadow offset",                OFFSET(shadow),          AV_OPT_TYPE_DOUBLE, { .dbl = 1.7 },  0, 100,     FLAGS },
++    { "marginH",         "default horizontal margin",            OFFSET(margin_h),        AV_OPT_TYPE_DOUBLE, { .dbl = 100.0 }, 0, 6400,   FLAGS },
++    { "marginV",         "default vertical margin",              OFFSET(margin_v),        AV_OPT_TYPE_DOUBLE, { .dbl = 42.0 }, 0, 320,     FLAGS },
++    { "fonts_dir",       "directory to scan for fonts",          OFFSET(fonts_dir),       AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0,       FLAGS },
++    { "fontconfig_file", "fontconfig file to load",              OFFSET(fc_file),         AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0,       FLAGS },
++    { "language",        "default language",                     OFFSET(language),        AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0,       FLAGS },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(inlineass);
++
++static const int ass_log_level_map[] = {
++    AV_LOG_FATAL, AV_LOG_ERROR, AV_LOG_WARNING, AV_LOG_WARNING, AV_LOG_INFO, AV_LOG_INFO, AV_LOG_VERBOSE, AV_LOG_DEBUG,
++};
++
++static void ass_log(int ass_level, const char *fmt, va_list args, void *ctx)
++{
++    int level = ass_log_level_map[av_clip(ass_level, 0, FF_ARRAY_ELEMS(ass_log_level_map) - 1)];
++    av_vlog(ctx, level, fmt, args);
++    av_log(ctx, level, "\n");
++}
++
++static av_cold int init(AVFilterContext *ctx)
++{
++    InlineAssContext *s = ctx->priv;
++
++    s->library = ass_library_init();
++    if (!s->library) {
++        av_log(ctx, AV_LOG_ERROR, "ass_library_init() failed!\n");
++        return AVERROR(EINVAL);
++    }
++    ass_set_message_cb(s->library, ass_log, ctx);
++    ass_set_extract_fonts(s->library, 1);
++    if (s->fonts_dir)
++        ass_set_fonts_dir(s->library, s->fonts_dir);
++
++    s->renderer = ass_renderer_init(s->library);
++    if (!s->renderer) {
++        av_log(ctx, AV_LOG_ERROR, "ass_renderer_init() failed!\n");
++        return AVERROR(EINVAL);
++    }
++    ass_set_font_scale(s->renderer, s->font_scale);
++
++    s->track = ass_new_track(s->library);
++    if (!s->track) {
++        av_log(ctx, AV_LOG_ERROR, "ass_new_track() failed!\n");
++        return AVERROR(EINVAL);
++    }
++    if (s->language)
++        s->track->Language = av_strdup(s->language);
++
++    return 0;
++}
++
++static av_cold void uninit(AVFilterContext *ctx)
++{
++    InlineAssContext *s = ctx->priv;
++    if (s->track)
++        ass_free_track(s->track);
++    if (s->renderer)
++        ass_renderer_done(s->renderer);
++    if (s->library)
++        ass_library_done(s->library);
++}
++
++static int query_formats(const AVFilterContext *ctx, AVFilterFormatsConfig **cfg_in, AVFilterFormatsConfig **cfg_out)
++{
++    return ff_set_common_formats2(ctx, cfg_in, cfg_out, ff_draw_supported_pixel_formats(0));
++}
++
++static int config_input(AVFilterLink *inlink)
++{
++    InlineAssContext *s = inlink->dst->priv;
++    ass_set_frame_size(s->renderer, inlink->w, inlink->h);
++    ass_set_storage_size(s->renderer, inlink->w, inlink->h);
++    s->draw_ready = 0;
++    return 0;
++}
++
++static enum AVColorSpace ass_color_space(ASS_YCbCrMatrix m, enum AVColorSpace link)
++{
++    switch (m) {
++    case YCBCR_NONE:            return link;
++    case YCBCR_SMPTE240M_TV:
++    case YCBCR_SMPTE240M_PC:    return AVCOL_SPC_SMPTE240M;
++    case YCBCR_FCC_TV:
++    case YCBCR_FCC_PC:          return AVCOL_SPC_FCC;
++    case YCBCR_BT709_TV:
++    case YCBCR_BT709_PC:        return AVCOL_SPC_BT709;
++    default:                    return AVCOL_SPC_SMPTE170M;
++    }
++}
++
++static enum AVColorRange ass_color_range(ASS_YCbCrMatrix m, enum AVColorRange link)
++{
++    switch (m) {
++    case YCBCR_NONE:            return link;
++    case YCBCR_SMPTE240M_PC:
++    case YCBCR_FCC_PC:
++    case YCBCR_BT709_PC:
++    case YCBCR_BT601_PC:        return AVCOL_RANGE_JPEG;
++    default:                    return AVCOL_RANGE_MPEG;
++    }
++}
++
++// subtitle colors are converted with the track's YCbCr matrix (known once the header is in)
++static int setup_draw(AVFilterLink *inlink)
++{
++    InlineAssContext *s = inlink->dst->priv;
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
++    int rgb = desc->flags & AV_PIX_FMT_FLAG_RGB;
++    int ret = ff_draw_init2(&s->draw, inlink->format,
++                            rgb ? inlink->colorspace : ass_color_space(s->track->YCbCrMatrix, inlink->colorspace),
++                            rgb ? inlink->color_range : ass_color_range(s->track->YCbCrMatrix, inlink->color_range),
++                            inlink->alpha_mode, 0);
++    if (ret < 0)
++        return ret;
++    s->draw_ready = s->got_header ? 2 : 1;
++    return 0;
++}
++
++// fonts attached to the media, then the default font and fontconfig (once, before the first render)
++static void update_fonts(AVFilterContext *ctx)
++{
++    InlineAssContext *s = ctx->priv;
++    for (; s->nb_fonts_seen < nb_fonts; s->nb_fonts_seen++)
++        ass_add_font(s->library, fonts[s->nb_fonts_seen].name, (char *)fonts[s->nb_fonts_seen].data,
++                     fonts[s->nb_fonts_seen].size);
++    if (!s->fonts_set) {
++        ass_set_fonts(s->renderer, s->font_path, s->font_name, ASS_FONTPROVIDER_AUTODETECT, s->fc_file, 1);
++        s->fonts_set = 1;
++    }
++}
++
++static void process_header(AVFilterContext *ctx, const InlineAssSource *src);
++
++// called with sources_lock held: header, new fonts and new events of our source go into the libass track
++static void update_track(AVFilterContext *ctx)
++{
++    InlineAssContext *s = ctx->priv;
++    const InlineAssSource *src;
++
++    update_fonts(ctx);
++    if (s->source >= nb_sources)
++        return;
++    src = &sources[s->source];
++    if (!s->got_header && src->have_header) {
++        process_header(ctx, src);
++        s->got_header = 1;
++    }
++    for (; s->nb_events_seen < src->nb_events; s->nb_events_seen++) {
++        const InlineAssEvent *e = &src->events[s->nb_events_seen];
++        ass_process_chunk(s->track, e->line, strlen(e->line), e->start, e->duration);
++    }
++}
++
++/* libass stores an RGBA color in the format RRGGBBTT, where TT is the transparency level */
++#define AR(c)  ( (c)>>24)
++#define AG(c)  (((c)>>16)&0xFF)
++#define AB(c)  (((c)>>8) &0xFF)
++#define AA(c)  ((0xFF-(c)) &0xFF)
++
++static void overlay_ass_image(InlineAssContext *s, AVFrame *picref, const ASS_Image *image)
++{
++    for (; image; image = image->next) {
++        uint8_t rgba_color[] = { AR(image->color), AG(image->color), AB(image->color), AA(image->color) };
++        FFDrawColor color;
++        ff_draw_color(&s->draw, &color, rgba_color);
++        ff_blend_mask(&s->draw, &color, picref->data, picref->linesize, picref->width, picref->height,
++                      image->bitmap, image->stride, image->w, image->h, 3, 0, image->dst_x, image->dst_y);
++    }
++}
++
++static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
++{
++    AVFilterContext *ctx = inlink->dst;
++    InlineAssContext *s = ctx->priv;
++    int64_t time_ms = av_rescale_q(picref->pts, inlink->time_base, av_make_q(1, 1000));
++    ASS_Image *image;
++
++    ff_mutex_lock(&sources_lock);
++    update_track(ctx);
++    ff_mutex_unlock(&sources_lock);
++
++    if (!s->draw_ready || (s->got_header && s->draw_ready == 1)) {   // again once the header gives the matrix
++        int ret = setup_draw(inlink);
++        if (ret < 0) {
++            av_frame_free(&picref);
++            return ret;
++        }
++    }
++
++    image = ass_render_frame(s->renderer, s->track, time_ms, NULL);
++    overlay_ass_image(s, picref, image);
++    return ff_filter_frame(ctx->outputs[0], picref);
++}
++
++static const AVFilterPad inlineass_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .flags        = AVFILTERPAD_FLAG_NEEDS_WRITABLE,
++        .filter_frame = filter_frame,
++        .config_props = config_input,
++    },
++};
++
++const FFFilter ff_vf_inlineass = {
++    .p.name        = "inlineass",
++    .p.description = NULL_IF_CONFIG_SMALL("Burn a subtitle stream decoded by the ffmpeg tool (-map_inlineass) onto the video."),
++    .p.priv_class  = &inlineass_class,
++    .priv_size     = sizeof(InlineAssContext),
++    .init          = init,
++    .uninit        = uninit,
++    FILTER_INPUTS(inlineass_inputs),
++    FILTER_OUTPUTS(ff_video_default_filterpad),
++    FILTER_QUERY_FUNC2(query_formats),
++};
++
++/* ---- styles (see process_header) ---- */
++
++// Header first; then (text subtitles, or ASS with apply_overrides=1) the overrides list plus the default sizes
++// scaled from 720 lines to the track's PlayResY, through libass's style overrides.
++static void process_header(AVFilterContext *ctx, const InlineAssSource *src)
++{
++    InlineAssContext *s = ctx->priv;
++    ASS_Track *track = s->track;
++    int is_ass = src->codec_id == AV_CODEC_ID_ASS;
++    double k;
++
++    if (src->header)
++        ass_process_codec_private(track, (char *)src->header, src->header_size);
++    k = (track->PlayResY > 0 ? track->PlayResY : 288) / 720.0;
++
++    if (!is_ass && !track->n_styles) {
++        // no style in the stream: a "Default" one with our defaults
++        int sid = ass_alloc_style(track);
++        ASS_Style *st = &track->styles[sid];
++        st->Name            = av_strdup("Default");
++        st->FontName        = av_strdup(s->font_name);
++        st->FontSize        = s->font_size * k;
++        st->PrimaryColour   = 0xffffff00;
++        st->SecondaryColour = 0x00ffff00;
++        st->OutlineColour   = 0x13070200;
++        st->BackColour      = 0x00000033;
++        st->Bold            = 500;
++        st->ScaleX          = 1.0;
++        st->ScaleY          = 1.0;
++        st->BorderStyle     = 1;
++        st->Outline         = s->outline * k;
++        st->Shadow          = s->shadow * k;
++        st->Alignment       = 2;
++        st->MarginL = st->MarginR = (int)(s->margin_h * k);
++        st->MarginV         = (int)(s->margin_v * k);
++        track->default_style = sid;
++    }
++
++    if (s->apply_overrides && (!is_ass || s->apply_overrides > 0)) {
++        char **list = NULL;
++        int n = 0;
++        const char *p = s->overrides;
++        while (p && *p) {
++            char *tok = av_get_token(&p, ",");
++            if (!tok || av_dynarray_add_nofree(&list, &n, tok) < 0) {
++                av_free(tok);
++                goto done;
++            }
++            if (*p)
++                p++;
++        }
++#define ADD(fmt, v) do {                                                   \
++            char *e = av_asprintf(fmt, (v) * k);                          \
++            if (!e || av_dynarray_add_nofree(&list, &n, e) < 0) {         \
++                av_free(e);                                               \
++                goto done;                                                \
++            }                                                             \
++        } while (0)
++        ADD("Outline=%f",  s->outline);
++        ADD("Shadow=%f",   s->shadow);
++        ADD("FontSize=%f", s->font_size);
++        ADD("MarginL=%f",  s->margin_h);
++        ADD("MarginR=%f",  s->margin_h);
++        ADD("MarginV=%f",  s->margin_v);
++#undef ADD
++        if (av_dynarray_add_nofree(&list, &n, NULL) >= 0) {
++            ass_set_style_overrides(s->library, list);
++            ass_process_force_style(track);
++        }
++done:
++        for (int i = 0; i < n; i++)
++            av_free(list[i]);
++        av_free(list);
++    }
++}
+diff --git a/libavfilter/vf_inlineass.h b/libavfilter/vf_inlineass.h
+new file mode 100644
+index 0000000..ab43227
+--- /dev/null
++++ b/libavfilter/vf_inlineass.h
+@@ -0,0 +1,37 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_VF_INLINEASS_H
++#define AVFILTER_VF_INLINEASS_H
++
++#include <stdint.h>
++
++#include "libavcodec/avcodec.h"
++
++/*
++ * The inlineass filter burns a subtitle stream that the ffmpeg tool decodes (-map_inlineass file:stream).
++ * The tool registers the stream as a source and hands every decoded subtitle to it; each inlineass instance
++ * (option "source", default 0) reads the source's header and events, so a reconfigured filter graph loses nothing.
++ * These calls are thread safe.
++ */
++int  avfilter_inlineass_add_source(int file_index, int stream_index);
++int  avfilter_inlineass_find_source(int file_index, int stream_index);   // -1 when not burned
++void avfilter_inlineass_add_font(const char *name, const uint8_t *data, int size);
++void avfilter_inlineass_append(int source, const AVCodecContext *dec, const AVSubtitle *sub);
++
++#endif /* AVFILTER_VF_INLINEASS_H */

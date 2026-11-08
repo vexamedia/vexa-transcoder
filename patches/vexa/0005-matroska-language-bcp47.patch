@@ -1,0 +1,58 @@
+Matroska demuxer: read LanguageBCP47 and prefer it over the legacy Language element, so stream metadata
+carries the IETF tag ("pt-BR", "zh-Hans") instead of ISO 639-2 ("por", "chi"); "und" is kept as "und".
+
+diff -ru a/libavformat/matroskadec.c b/libavformat/matroskadec.c
+--- a/libavformat/matroskadec.c	2026-11-08 08:29:15.952250224 -0300
++++ b/libavformat/matroskadec.c	2026-11-08 08:31:44.977991195 -0300
+@@ -269,6 +269,7 @@
+     char    *codec_id;
+     EbmlBin  codec_priv;
+     char    *language;
++    char    *language_bcp47;
+     double time_scale;
+     uint64_t default_duration;
+     uint64_t flag_default;
+@@ -447,7 +448,7 @@
+ // incomplete type (6.7.2 in C90, 6.9.2 in C99).
+ // Removing the sizes breaks MSVC.
+ static EbmlSyntax ebml_syntax[3], matroska_segment[9], matroska_track_video_color[15], matroska_track_video[19],
+-                  matroska_track[33], matroska_track_encoding[6], matroska_track_encodings[2],
++                  matroska_track[34], matroska_track_encoding[6], matroska_track_encodings[2],
+                   matroska_track_combine_planes[2], matroska_track_operation[2], matroska_block_addition_mapping[5], matroska_tracks[2],
+                   matroska_attachments[2], matroska_chapter_entry[9], matroska_chapter[6], matroska_chapters[2],
+                   matroska_index_entry[3], matroska_index[2], matroska_tag[3], matroska_tags[2], matroska_seekhead[2],
+@@ -615,6 +616,7 @@
+     { MATROSKA_ID_CODECPRIVATE,          EBML_BIN,   0, 0, offsetof(MatroskaTrack, codec_priv) },
+     { MATROSKA_ID_CODECDELAY,            EBML_UINT,  0, 0, offsetof(MatroskaTrack, codec_delay),  { .u = 0 } },
+     { MATROSKA_ID_TRACKLANGUAGE,         EBML_STR,   0, 0, offsetof(MatroskaTrack, language),     { .s = "eng" } },
++    { MATROSKA_ID_TRACKLANGUAGEBCP47,    EBML_STR,   0, 0, offsetof(MatroskaTrack, language_bcp47) },
+     { MATROSKA_ID_TRACKDEFAULTDURATION,  EBML_UINT,  0, 0, offsetof(MatroskaTrack, default_duration) },
+     { MATROSKA_ID_TRACKTIMECODESCALE,    EBML_FLOAT, 0, 0, offsetof(MatroskaTrack, time_scale),   { .f = 1.0 } },
+     { MATROSKA_ID_TRACKFLAGCOMMENTARY,   EBML_UINT,  0, 0, offsetof(MatroskaTrack, flag_comment), { .u = 0 } },
+@@ -3250,8 +3252,13 @@
+                         AV_DICT_DONT_STRDUP_VAL);
+         }
+ 
+-        if (strcmp(track->language, "und"))
+-            av_dict_set(&st->metadata, "language", track->language, 0);
++        {
++            /* The IETF tag (LanguageBCP47, e.g. "pt-BR") takes precedence over the legacy ISO 639-2 one;
++             * an undetermined language is reported as "und". */
++            const char *lang = track->language_bcp47 && *track->language_bcp47 &&
++                               strcmp(track->language_bcp47, "und") ? track->language_bcp47 : track->language;
++            av_dict_set(&st->metadata, "language", lang && *lang ? lang : "und", 0);
++        }
+         av_dict_set(&st->metadata, "title", track->name, 0);
+ 
+         if (track->time_scale < 0.01) {
+diff -ru a/libavformat/matroska.h b/libavformat/matroska.h
+--- a/libavformat/matroska.h	2026-11-08 08:29:15.952149075 -0300
++++ b/libavformat/matroska.h	2026-11-08 08:29:15.995421200 -0300
+@@ -94,6 +94,7 @@
+ #define MATROSKA_ID_SEEKPREROLL 0x56BB
+ #define MATROSKA_ID_TRACKNAME  0x536E
+ #define MATROSKA_ID_TRACKLANGUAGE 0x22B59C
++#define MATROSKA_ID_TRACKLANGUAGEBCP47 0x22B59D
+ #define MATROSKA_ID_TRACKFLAGENABLED 0xB9
+ #define MATROSKA_ID_TRACKFLAGDEFAULT 0x88
+ #define MATROSKA_ID_TRACKFLAGFORCED 0x55AA

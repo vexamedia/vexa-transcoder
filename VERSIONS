@@ -1,0 +1,78 @@
+# Pinned sources of the Vexa Transcoder. This is the only file to edit when updating.
+#
+# The base is the official FFmpeg release. On top of it go the patch series maintained by Jellyfin (only its
+# debian/patches folder is downloaded) and then ours (patches/vexa). The libraries use the commits Jellyfin's builder
+# pins for the same patch series (builder/scripts.d/*.sh at that tag), a combination that is tested together.
+# To update: pick the FFmpeg release and the matching patch series tag, copy both commits here and the SCRIPT_COMMIT of
+# each library, run ./build.sh and then the tests.
+#
+# Git sources are checked by commit id; tarballs by sha256.
+
+# Version of our builds: <FFmpeg version>-<Vexa revision>
+VEXA_VERSION=8.1.3-1
+
+FFMPEG_REPO=https://github.com/FFmpeg/FFmpeg.git
+FFMPEG_TAG=n8.1.3
+FFMPEG_COMMIT=1041abdc962f4cc4f394aa8de9dc5236c0c3b9e7
+
+# Jellyfin's patch series for this FFmpeg release (debian/patches only)
+JELLYFIN_PATCHES_REPO=https://github.com/jellyfin/jellyfin-ffmpeg.git
+JELLYFIN_PATCHES_TAG=v8.1.3-2
+JELLYFIN_PATCHES_COMMIT=7250de8375a4959ac1c25c139ce9789fdac199fb
+
+ZLIB_REPO=https://github.com/madler/zlib.git
+ZLIB_COMMIT=f9dd6009be3ed32415edf1e89d1bc38380ecb95d
+
+X264_REPO=https://code.videolan.org/videolan/x264.git
+X264_COMMIT=0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee
+
+X265_REPO=https://github.com/Multicorewareinc/x265.git
+X265_COMMIT=e9b88125dc21393b3fd8d68e98083bdfb89778a8
+
+DAV1D_REPO=https://code.videolan.org/videolan/dav1d.git
+DAV1D_COMMIT=54706fc6bc0cdecab7e9593974a4039cc038fca7
+
+OPUS_REPO=https://github.com/xiph/opus.git
+OPUS_COMMIT=788cc89ce4f2c42025d8c70ec1b4457dc89cd50f
+
+FREETYPE_REPO=https://github.com/freetype/freetype.git
+FREETYPE_COMMIT=1803559c4ee407d0bcbf2a67dbe96690cee869d2
+
+FRIBIDI_REPO=https://github.com/fribidi/fribidi.git
+FRIBIDI_COMMIT=5c85a174650ab8ef106ce85f13bcf2950d3fc65f
+
+HARFBUZZ_REPO=https://github.com/harfbuzz/harfbuzz.git
+HARFBUZZ_COMMIT=56feae4035bdd48f62ba2b8d8c16232d4d89b3a4
+
+LIBASS_REPO=https://github.com/libass/libass.git
+LIBASS_COMMIT=4a05d8127f525943ebf45fdc6497c9e665947f0d
+
+LIBUNIBREAK_REPO=https://github.com/adah1972/libunibreak.git
+LIBUNIBREAK_COMMIT=3ce4bfa3129ff3738046a44a6db533d2ce25af2b
+
+LIBXML2_REPO=https://github.com/GNOME/libxml2.git
+LIBXML2_COMMIT=a7511af09f99995cdf81994db21f4eba564276b5
+
+FONTCONFIG_REPO=https://chromium.googlesource.com/external/fontconfig
+FONTCONFIG_COMMIT=6d0a98982ec351c165c9224c8b7dbdfca3010e47
+
+ZIMG_REPO=https://github.com/sekrit-twc/zimg.git
+ZIMG_COMMIT=5e8c32222569edf3a712f83d7cff80ad4dd9ab6e
+
+# Jellyfin builds LAME from svn trunk (r6531); we use the last release tarball (no svn needed).
+LAME_URL=https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz
+LAME_SHA256=ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e
+
+# Build tool only (fontconfig needs it at build time; nothing of it goes into the binary).
+GPERF_URL=https://ftp.gnu.org/gnu/gperf/gperf-3.1.tar.gz
+GPERF_SHA256=588546b945bba4b70b6a3a616e80b4ab466e3f33024a352fc2198112cdbb3ae2
+
+# Windows only. libiconv: glibc and macOS have iconv built in (Jellyfin's builder pins the same release from git).
+LIBICONV_URL=https://ftp.gnu.org/gnu/libiconv/libiconv-1.19.tar.gz
+LIBICONV_SHA256=88dd96a8c0464eca144fc791ae60cd31cd8ee78321e67397e25fc095c4a19aa6
+
+# Windows cross toolchain (clang + mingw-w64 + libc++, UCRT), one archive per build machine architecture.
+LLVM_MINGW_X86_64_URL=https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64.tar.xz
+LLVM_MINGW_X86_64_SHA256=55064b60b991a1e1e8090b8c2f84e82b22cfe5903d12c159d65064cf5e8ae335
+LLVM_MINGW_AARCH64_URL=https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-ubuntu-22.04-aarch64.tar.xz
+LLVM_MINGW_AARCH64_SHA256=ca16bb0f4f485876496fa46ad8d353c525eba57d0cf9e9e49ec1738fe4810151

@@ -1,0 +1,683 @@
+diff --git a/fftools/Makefile b/fftools/Makefile
+index 10a2a46..e878f0d 100644
+--- a/fftools/Makefile
++++ b/fftools/Makefile
+@@ -20,6 +20,7 @@ OBJS-ffmpeg +=                  \
+     fftools/ffmpeg_mux.o        \
+     fftools/ffmpeg_mux_init.o   \
+     fftools/ffmpeg_opt.o        \
++    fftools/ffmpeg_report.o     \
+     fftools/ffmpeg_sched.o      \
+     fftools/graph/graphprint.o        \
+     fftools/sync_queue.o        \
+diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c
+index 8c015ed..2375a1c 100644
+--- a/fftools/ffmpeg.c
++++ b/fftools/ffmpeg.c
+@@ -82,6 +82,7 @@
+ #include "compat/android/binder.h"
+ #endif
+ #include "ffmpeg.h"
++#include "ffmpeg_report.h"
+ #include "ffmpeg_sched.h"
+ #include "ffmpeg_utils.h"
+ #include "graph/graphprint.h"
+@@ -591,6 +592,24 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
+     int ret;
+     float t;
+ 
++    if (!is_last_report && report_enabled()) {
++        // progress for the server every stats period, on its own clock: the console report below waits until every
++        // output has written its header, which a subtitle-only output may not do for a long time
++        static int64_t last_server_report = -1;
++        if (last_server_report == -1 || cur_time - last_server_report >= stats_period) {
++            // video decoding in software: 0 (hardware decoding would report 1); -1 when no video is decoded
++            int vdec_hw = -1;
++            last_server_report = cur_time;
++            for (InputStream *ist = ist_iter(NULL); ist; ist = ist_iter(ist))
++                if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO && ist->decoder && ist->decoder->frames_decoded)
++                    vdec_hw = 0;
++            // the scheduler's position stays unset while any output (a subtitle file, say) has no packet yet:
++            // then the progress comes from what the main output has written
++            report_progress(pts != AV_NOPTS_VALUE ? pts : of_last_mux_time(output_files[0]), total_size, cur_time,
++                            nb_input_files ? input_files[0]->ctx : NULL, vdec_hw);
++        }
++    }
++
+     if (!print_stats && !is_last_report && !progress_avio)
+         return;
+ 
+@@ -1029,6 +1048,7 @@ int main(int argc, char **argv)
+ 
+     av_log_set_flags(AV_LOG_SKIP_REPEATED);
+     parse_loglevel(argc, argv, options);
++    report_init(argc, argv, options);
+ 
+ #if CONFIG_AVDEVICE
+     avdevice_register_all();
+@@ -1065,6 +1085,8 @@ int main(int argc, char **argv)
+     android_binder_threadpool_init_if_required();
+ #endif
+ 
++    report_duration(nb_input_files ? input_files[0]->ctx : NULL);
++
+     current_time = ti = get_benchmark_time_stamps();
+     ret = transcode(sch);
+     if (ret >= 0 && do_benchmark) {
+diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
+index ce107d2..aa17e80 100644
+--- a/fftools/ffmpeg.h
++++ b/fftools/ffmpeg.h
+@@ -241,6 +241,7 @@ typedef struct OptionsContext {
+     SpecifierOptList pass;
+     SpecifierOptList passlogfiles;
+     SpecifierOptList max_muxing_queue_size;
++    SpecifierOptList strict_ts;
+     SpecifierOptList muxing_queue_data_threshold;
+     SpecifierOptList guess_layout_max;
+     SpecifierOptList apad;
+@@ -462,6 +463,9 @@ typedef struct DecoderOpts {
+     // Either forced (when DECODER_FLAG_FRAMERATE_FORCED is set) or
+     // estimated (otherwise) video framerate.
+     AVRational                  framerate;
++
++    // subtitles: inlineass source + 1 that receives every decoded subtitle (0: none)
++    int                         inlineass_source;
+ } DecoderOpts;
+ 
+ typedef struct Decoder {
+@@ -939,6 +943,8 @@ void of_free(OutputFile **pof);
+ void of_enc_stats_close(void);
+ 
+ int64_t of_filesize(OutputFile *of);
++/* furthest timestamp written to the file so far (AV_TIME_BASE units), AV_NOPTS_VALUE before any packet */
++int64_t of_last_mux_time(OutputFile *of);
+ 
+ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch);
+ void ifile_close(InputFile **f);
+diff --git a/fftools/ffmpeg_dec.c b/fftools/ffmpeg_dec.c
+index e424c0b..e1e9f64 100644
+--- a/fftools/ffmpeg_dec.c
++++ b/fftools/ffmpeg_dec.c
+@@ -35,6 +35,8 @@
+ #include "libavcodec/codec.h"
+ 
+ #include "ffmpeg.h"
++#include "config_components.h"
++#include "libavfilter/vf_inlineass.h"
+ 
+ typedef struct DecoderPriv {
+     Decoder             dec;
+@@ -70,6 +72,7 @@ typedef struct DecoderPriv {
+ 
+     /* previous decoded subtitles */
+     AVFrame            *sub_prev[2];
++    int                 inlineass_source;   // see DecoderOpts
+     AVFrame            *sub_heartbeat;
+ 
+     Scheduler          *sch;
+@@ -680,6 +683,11 @@ static int transcode_subtitles(DecoderPriv *dp, const AVPacket *pkt,
+ 
+     dp->dec.frames_decoded++;
+ 
++#if CONFIG_INLINEASS_FILTER
++    if (dp->inlineass_source)
++        avfilter_inlineass_append(dp->inlineass_source - 1, dp->dec_ctx, &subtitle);
++#endif
++
+     // XXX the queue for transferring data to consumers runs
+     // on AVFrames, so we wrap AVSubtitle in an AVBufferRef and put that
+     // inside the frame
+@@ -1532,6 +1540,7 @@ static int dec_open(DecoderPriv *dp, AVDictionary **dec_opts,
+ 
+     dp->flags      = o->flags;
+     dp->log_parent = o->log_parent;
++    dp->inlineass_source = o->inlineass_source;
+ 
+     dp->dec.type                = codec->type;
+     dp->framerate_in            = o->framerate;
+diff --git a/fftools/ffmpeg_demux.c b/fftools/ffmpeg_demux.c
+index c0459e9..1cead9d 100644
+--- a/fftools/ffmpeg_demux.c
++++ b/fftools/ffmpeg_demux.c
+@@ -20,6 +20,9 @@
+ #include <stdint.h>
+ 
+ #include "ffmpeg.h"
++#include "ffmpeg_report.h"
++#include "config_components.h"
++#include "libavfilter/vf_inlineass.h"
+ #include "ffmpeg_sched.h"
+ #include "ffmpeg_utils.h"
+ 
+@@ -1028,6 +1031,9 @@ int ist_use(InputStream *ist, int decoding_needed,
+         ds->dec_opts.par   = ist->par;
+ 
+         ds->dec_opts.log_parent = ist;
++#if CONFIG_INLINEASS_FILTER
++        ds->dec_opts.inlineass_source = avfilter_inlineass_find_source(ist->file->index, ist->index) + 1;
++#endif
+ 
+         ds->decoded_params = av_frame_alloc();
+         if (!ds->decoded_params)
+@@ -2164,6 +2170,7 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
+                 return ret;
+         }
+     }
++    report_input_streams(ic);
+ 
+     if (start_time != AV_NOPTS_VALUE && start_time_eof != AV_NOPTS_VALUE) {
+         av_log(d, AV_LOG_WARNING, "Cannot use -ss and -sseof both, using -ss\n");
+diff --git a/fftools/ffmpeg_mux.c b/fftools/ffmpeg_mux.c
+index 25f66dd..e508ca3 100644
+--- a/fftools/ffmpeg_mux.c
++++ b/fftools/ffmpeg_mux.c
+@@ -177,7 +177,7 @@ static int mux_fixup_ts(Muxer *mux, MuxStream *ms, AVPacket *pkt)
+         if ((ost->type == AVMEDIA_TYPE_AUDIO || ost->type == AVMEDIA_TYPE_VIDEO || ost->type == AVMEDIA_TYPE_SUBTITLE) &&
+             pkt->dts != AV_NOPTS_VALUE &&
+             ms->last_mux_dts != AV_NOPTS_VALUE) {
+-            int64_t max = ms->last_mux_dts + !(mux->fc->oformat->flags & AVFMT_TS_NONSTRICT);
++            int64_t max = ms->last_mux_dts + (ms->strict_ts && !(mux->fc->oformat->flags & AVFMT_TS_NONSTRICT));
+             if (pkt->dts < max) {
+                 int loglevel = max - pkt->dts > 2 || ost->type == AVMEDIA_TYPE_VIDEO ? AV_LOG_WARNING : AV_LOG_DEBUG;
+                 if (exit_on_error)
+@@ -890,3 +890,18 @@ int64_t of_filesize(OutputFile *of)
+     Muxer *mux = mux_from_of(of);
+     return atomic_load(&mux->last_filesize);
+ }
++
++int64_t of_last_mux_time(OutputFile *of)
++{
++    int64_t t = AV_NOPTS_VALUE;
++
++    // furthest timestamp written to this file (AV_TIME_BASE units); a progress estimate, so a racy read is fine
++    for (int i = 0; i < of->nb_streams; i++) {
++        const MuxStream *ms = ms_from_ost(of->streams[i]);
++        const int64_t dts = ms->last_mux_dts;
++        if (dts == AV_NOPTS_VALUE)
++            continue;
++        t = FFMAX(t == AV_NOPTS_VALUE ? INT64_MIN : t, av_rescale_q(dts, ms->ost.st->time_base, AV_TIME_BASE_Q));
++    }
++    return t;
++}
+diff --git a/fftools/ffmpeg_mux.h b/fftools/ffmpeg_mux.h
+index 4ca8ab7..153fe82 100644
+--- a/fftools/ffmpeg_mux.h
++++ b/fftools/ffmpeg_mux.h
+@@ -68,6 +68,8 @@ typedef struct MuxStream {
+     /* dts of the last packet sent to the muxer, in the stream timebase
+      * used for making up missing dts values */
+     int64_t         last_mux_dts;
++    // 0: a packet may repeat the previous dts (overlapping subtitle cues); 1: strictly increasing (default)
++    int             strict_ts;
+ 
+     int64_t         stream_duration;
+     AVRational      stream_duration_tb;
+diff --git a/fftools/ffmpeg_mux_init.c b/fftools/ffmpeg_mux_init.c
+index 35d3f10..66e5078 100644
+--- a/fftools/ffmpeg_mux_init.c
++++ b/fftools/ffmpeg_mux_init.c
+@@ -1540,6 +1540,9 @@ static int ost_add(Muxer *mux, const OptionsContext *o, enum AVMediaType type,
+     opt_match_per_stream_int(ost, &o->bits_per_raw_sample, oc, st,
+                                    &ost->bits_per_raw_sample);
+ 
++    ms->strict_ts = 1;
++    opt_match_per_stream_int(ost, &o->strict_ts, oc, st, &ms->strict_ts);
++
+     opt_match_per_stream_int(ost, &o->fix_sub_duration_heartbeat,
+                              oc, st, &ost->fix_sub_duration_heartbeat);
+ 
+diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
+index a256619..8df44bb 100644
+--- a/fftools/ffmpeg_opt.c
++++ b/fftools/ffmpeg_opt.c
+@@ -28,6 +28,9 @@
+ #endif
+ 
+ #include "ffmpeg.h"
++#include "ffmpeg_report.h"
++#include "config_components.h"
++#include "libavfilter/vf_inlineass.h"
+ #include "ffmpeg_sched.h"
+ #include "cmdutils.h"
+ #include "opt_common.h"
+@@ -552,6 +555,59 @@ static int opt_data_codec(void *optctx, const char *opt, const char *arg)
+     return parse_option(o, "codec:d", arg, options);
+ }
+ 
++#if CONFIG_INLINEASS_FILTER
++/* -map_inlineass file:stream: the subtitle stream burned by the inlineass filter (it still needs a decoder, e.g. an
++ * output that maps it to a null muxer) */
++static int opt_map_inlineass(void *optctx, const char *opt, const char *arg)
++{
++    static int fonts_added;
++    StreamSpecifier ss;
++    char *end;
++    long file_idx = strtol(arg, &end, 0);
++    int ret, found = 0;
++
++    if (file_idx < 0 || file_idx >= nb_input_files) {
++        av_log(NULL, AV_LOG_FATAL, "Invalid subtitle input file index: %ld.\n", file_idx);
++        return AVERROR(EINVAL);
++    }
++    ret = stream_specifier_parse(&ss, *end == ':' ? end + 1 : end, 0, NULL);
++    if (ret < 0)
++        return ret;
++    for (int i = 0; i < input_files[file_idx]->nb_streams && !found; i++) {
++        AVFormatContext *ic = input_files[file_idx]->ctx;
++        if (!stream_specifier_match(&ss, ic, ic->streams[i], NULL))
++            continue;
++        if (ic->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
++            av_log(NULL, AV_LOG_ERROR, "Stream '%s' is not a subtitle stream.\n", arg);
++            continue;
++        }
++        avfilter_inlineass_add_source(file_idx, i);
++        found = 1;
++    }
++    stream_specifier_uninit(&ss);
++    if (!found)
++        av_log(NULL, AV_LOG_ERROR, "Subtitle stream map '%s' matches no streams.\n", arg);
++
++    // fonts attached to the inputs (Matroska attachments)
++    for (int f = 0; f < nb_input_files && !fonts_added; f++) {
++        AVFormatContext *ic = input_files[f]->ctx;
++        for (unsigned i = 0; i < ic->nb_streams; i++) {
++            const AVStream *st = ic->streams[i];
++            const AVDictionaryEntry *name = av_dict_get(st->metadata, "filename", NULL, 0);
++            const char *ext;
++            if (st->codecpar->codec_type != AVMEDIA_TYPE_ATTACHMENT || !st->codecpar->extradata_size || !name)
++                continue;
++            ext = strrchr(name->value, '.');
++            if (st->codecpar->codec_id == AV_CODEC_ID_TTF || st->codecpar->codec_id == AV_CODEC_ID_OTF ||
++                (ext && (!av_strcasecmp(ext, ".ttf") || !av_strcasecmp(ext, ".otf") || !av_strcasecmp(ext, ".ttc"))))
++                avfilter_inlineass_add_font(name->value, st->codecpar->extradata, st->codecpar->extradata_size);
++        }
++    }
++    fonts_added = 1;
++    return 0;
++}
++#endif
++
+ static int opt_map(void *optctx, const char *opt, const char *arg)
+ {
+     OptionsContext *o = optctx;
+@@ -1722,6 +1778,17 @@ const OptionDef options[] = {
+     { "progress",               OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+         { .func_arg = opt_progress },
+       "write program-readable progress information", "url" },
++#if CONFIG_INLINEASS_FILTER
++    { "map_inlineass",          OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT | OPT_PERFILE | OPT_OUTPUT,
++        { .func_arg = opt_map_inlineass },
++      "subtitle stream to burn into the video with the inlineass filter", "input_file_id:stream_specifier" },
++#endif
++    { "progressurl",            OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
++        { .func_arg = report_opt_noop },
++      "report status and progress to the media server with HTTP PUTs", "url" },
++    { "loglevel_server",        OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
++        { .func_arg = report_opt_noop },
++      "also send log lines at this level or above to the media server", "loglevel" },
+     { "stdin",                  OPT_TYPE_BOOL, OPT_EXPERT,
+         { &stdin_interaction },
+       "enable or disable interaction on standard input" },
+@@ -2140,6 +2207,9 @@ const OptionDef options[] = {
+         "set options from indicated preset file", "filename",
+         .u1.name_canon = "pre", },
+ 
++    { "strict_ts", OPT_TYPE_INT, OPT_PERSTREAM | OPT_EXPERT | OPT_OUTPUT,
++        { .off = OFFSET(strict_ts) },
++        "require strictly-increasing timestamps (0 lets a packet repeat the previous dts)", "bool" },
+     { "max_muxing_queue_size", OPT_TYPE_INT, OPT_PERSTREAM | OPT_EXPERT | OPT_OUTPUT,
+         { .off = OFFSET(max_muxing_queue_size) },
+         "maximum number of packets that can be buffered while waiting for all streams to initialize", "packets" },
+diff --git a/fftools/ffmpeg_report.c b/fftools/ffmpeg_report.c
+new file mode 100644
+index 0000000..60eed9d
+--- /dev/null
++++ b/fftools/ffmpeg_report.c
+@@ -0,0 +1,295 @@
++/*
++ * Progress and log reporting to the media server that started this process.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <stdio.h>
++#include <string.h>
++
++#include "ffmpeg_report.h"
++
++#include "libavcodec/avcodec.h"
++#include "libavutil/avstring.h"
++#include "libavutil/bprint.h"
++#include "libavutil/channel_layout.h"
++#include "libavutil/log.h"
++#include "libavutil/mem.h"
++#include "libavutil/thread.h"
++
++static const char *progress_url;
++static int         server_log_level = AV_LOG_QUIET;
++
++static AVMutex     request_mutex = AV_MUTEX_INITIALIZER;
++static _Thread_local int in_request;   // no reporting from inside a report (the HTTP code logs too)
++
++// RFC 3986 percent-encoding of everything but the unreserved characters
++static void bprint_url_escaped(AVBPrint *b, const char *s)
++{
++    for (; *s; s++) {
++        unsigned char c = *s;
++        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
++            c == '-' || c == '_' || c == '.' || c == '~')
++            av_bprint_chars(b, c, 1);
++        else
++            av_bprintf(b, "%%%02X", c);
++    }
++}
++
++// one request on its own connection; the reply body is read and dropped
++static void http_request(const char *url, const char *method)
++{
++    AVIOContext *io = NULL;
++    AVDictionary *opts = NULL;
++    uint8_t buf[1024];
++
++    if (in_request)
++        return;
++    in_request = 1;
++    ff_mutex_lock(&request_mutex);
++
++    av_dict_set(&opts, "method", method, 0);
++    if (avio_open2(&io, url, AVIO_FLAG_READ, NULL, &opts) >= 0) {
++        while (avio_read(io, buf, sizeof(buf)) > 0)
++            ;
++        avio_closep(&io);
++    }
++    av_dict_free(&opts);
++
++    ff_mutex_unlock(&request_mutex);
++    in_request = 0;
++}
++
++static void put_query(const char *query)
++{
++    AVBPrint b;
++    av_bprint_init(&b, 0, AV_BPRINT_SIZE_AUTOMATIC);
++    av_bprintf(&b, "%s?%s", progress_url, query);
++    if (av_bprint_is_complete(&b))
++        http_request(b.str, "PUT");
++    av_bprint_finalize(&b, NULL);
++}
++
++/* log forwarding: whole lines, per thread */
++static void report_log_callback(void *ptr, int level, const char *fmt, va_list vl)
++{
++    static _Thread_local char cur_line[1024];
++    char line[1024];
++    int print_prefix;
++    va_list vl2;
++
++    va_copy(vl2, vl);
++    av_log_default_callback(ptr, level, fmt, vl2);
++    va_end(vl2);
++
++    if (level > server_log_level || in_request || !progress_url)
++        return;
++
++    print_prefix = cur_line[0] == 0;
++    av_log_format_line(ptr, level, fmt, vl, line, sizeof(line), &print_prefix);
++    av_strlcat(cur_line, line, sizeof(cur_line));
++    if (print_prefix) {   // the line is complete
++        size_t len = strlen(cur_line);
++        if (len) {
++            AVBPrint b;
++            // server levels: 0 error, 1 warning, 2 info, 3 debug, 4 verbose
++            int server_level = level < AV_LOG_ERROR ? 0 : level / 8 - 2;
++            if (cur_line[len - 1] == '\n')
++                cur_line[len - 1] = 0;
++            av_bprint_init(&b, 0, AV_BPRINT_SIZE_AUTOMATIC);
++            av_bprintf(&b, "%s/log?level=%d&message=", progress_url, server_level);
++            bprint_url_escaped(&b, cur_line);
++            if (av_bprint_is_complete(&b))
++                http_request(b.str, "POST");
++            av_bprint_finalize(&b, NULL);
++        }
++        cur_line[0] = 0;
++    }
++}
++
++int report_opt_noop(void *optctx, const char *opt, const char *arg)
++{
++    return 0;   // already applied by report_init()
++}
++
++int report_enabled(void)
++{
++    return progress_url != NULL;
++}
++
++void report_init(int argc, char **argv, const OptionDef *options)
++{
++    int idx = locate_option(argc, argv, options, "progressurl");
++    if (idx && argv[idx + 1])
++        progress_url = argv[idx + 1];
++
++    idx = locate_option(argc, argv, options, "loglevel_server");
++    if (idx && argv[idx + 1]) {
++        static const struct { const char *name; int level; } levels[] = {
++            { "quiet", AV_LOG_QUIET }, { "panic", AV_LOG_PANIC }, { "fatal", AV_LOG_FATAL }, { "error", AV_LOG_ERROR },
++            { "warning", AV_LOG_WARNING }, { "info", AV_LOG_INFO }, { "verbose", AV_LOG_VERBOSE },
++            { "debug", AV_LOG_DEBUG }, { "trace", AV_LOG_TRACE },
++        };
++        const char *arg = argv[idx + 1];
++        char *end;
++        long v = strtol(arg, &end, 10);
++        server_log_level = *end ? AV_LOG_QUIET : (int)v;
++        for (int i = 0; i < FF_ARRAY_ELEMS(levels); i++)
++            if (!strcmp(arg, levels[i].name))
++                server_log_level = levels[i].level;
++        if (server_log_level > AV_LOG_QUIET)
++            av_log_set_callback(report_log_callback);
++    }
++
++}
++
++void report_duration(const AVFormatContext *ic)
++{
++    char q[64];
++    double duration = -1;
++    if (!progress_url)
++        return;
++    if (ic && ic->duration != AV_NOPTS_VALUE)
++        duration = ic->duration / (double)AV_TIME_BASE;
++    snprintf(q, sizeof(q), "duration=%f", duration);
++    put_query(q);
++}
++
++static void report_stream(const AVStream *st, int detail)
++{
++    const AVCodecParameters *par = st->codecpar;
++    const AVDictionaryEntry *lang = av_dict_get(st->metadata, "language", NULL, 0);
++    const char *profile = avcodec_profile_name(par->codec_id, par->profile);
++    AVBPrint b;
++
++    if (st->disposition & AV_DISPOSITION_ATTACHED_PIC)
++        return;
++    if (par->codec_type != AVMEDIA_TYPE_VIDEO && par->codec_type != AVMEDIA_TYPE_AUDIO &&
++        !(detail && par->codec_type == AVMEDIA_TYPE_SUBTITLE))
++        return;
++
++    av_bprint_init(&b, 0, AV_BPRINT_SIZE_AUTOMATIC);
++    av_bprintf(&b, "%s/%s?index=%d&id=%d&codec=%s&type=%s", progress_url, detail ? "streamDetail" : "stream",
++               st->index, st->id, avcodec_get_name(par->codec_id), av_get_media_type_string(par->codec_type));
++    if (detail && par->bit_rate)
++        av_bprintf(&b, "&bitrate=%"PRId64, par->bit_rate);
++    if (detail && profile) {
++        av_bprintf(&b, "&profile=");
++        bprint_url_escaped(&b, profile);
++    }
++    if (detail) {
++        if (lang && lang->value && *lang->value) {
++            av_bprintf(&b, "&language=");
++            bprint_url_escaped(&b, lang->value);
++        }
++        if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
++            av_bprintf(&b, "&width=%d&height=%d", par->width, par->height);
++            av_bprintf(&b, "&interlaced=%d", par->field_order != AV_FIELD_PROGRESSIVE && par->field_order != AV_FIELD_UNKNOWN);
++            if (par->sample_aspect_ratio.num && par->sample_aspect_ratio.den)
++                av_bprintf(&b, "&sar=%d:%d", par->sample_aspect_ratio.num, par->sample_aspect_ratio.den);
++            if (par->level != AV_LEVEL_UNKNOWN)
++                av_bprintf(&b, "&level=%d", par->level);
++            if (st->avg_frame_rate.num && st->avg_frame_rate.den)
++                av_bprintf(&b, "&frameRate=%.3f", av_q2d(st->avg_frame_rate));
++        } else if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
++            char layout[256];
++            char *l, *r, *p = layout;
++            av_channel_layout_describe(&par->ch_layout, layout, sizeof(layout));
++            l = strchr(layout, '(');
++            r = strrchr(layout, ')');
++            if (l && r && l > layout + 8) {   // "6 channels (FL+FR+...)": keep what is inside
++                p = l + 1;
++                *r = 0;
++            }
++            av_bprintf(&b, "&channels=%d&layout=", par->ch_layout.nb_channels);
++            bprint_url_escaped(&b, p);
++            av_bprintf(&b, "&sampleRate=%d", par->sample_rate);
++            if (par->bits_per_raw_sample)
++                av_bprintf(&b, "&bitDepth=%d", par->bits_per_raw_sample);
++        }
++#define DISPOSITION(flag, name) if (st->disposition & AV_DISPOSITION_##flag) av_bprintf(&b, "&disp_" name "=1")
++        DISPOSITION(DEFAULT,          "default");
++        DISPOSITION(DUB,              "dub");
++        DISPOSITION(ORIGINAL,         "original");
++        DISPOSITION(COMMENT,          "comment");
++        DISPOSITION(LYRICS,           "lyrics");
++        DISPOSITION(KARAOKE,          "karaoke");
++        DISPOSITION(FORCED,           "forced");
++        DISPOSITION(HEARING_IMPAIRED, "hearing_impaired");
++        DISPOSITION(VISUAL_IMPAIRED,  "visual_impaired");
++        DISPOSITION(CLEAN_EFFECTS,    "clean_effects");
++        DISPOSITION(ATTACHED_PIC,     "attached_pic");
++        DISPOSITION(TIMED_THUMBNAILS, "timed_thumbnails");
++#undef DISPOSITION
++    }
++    if (av_bprint_is_complete(&b))
++        http_request(b.str, "PUT");
++    av_bprint_finalize(&b, NULL);
++}
++
++void report_input_streams(const AVFormatContext *ic)
++{
++    if (!progress_url)
++        return;
++    for (unsigned i = 0; i < ic->nb_streams; i++)
++        report_stream(ic->streams[i], 0);
++    for (unsigned i = 0; i < ic->nb_streams; i++)
++        report_stream(ic->streams[i], 1);
++}
++
++void report_progress(int64_t pts, int64_t total_size, int64_t cur_time, const AVFormatContext *first_input,
++                     int vdec_hw_status)
++{
++    static int64_t last_time = -1, last_pts = 0;
++    static int last_remaining = 0;
++    int64_t secs, total_secs = 0, run_time;
++    float speed;
++    int remaining, smoothed;
++    char q[256];
++
++    if (!progress_url || pts == AV_NOPTS_VALUE)
++        return;
++    if (last_time < 0) {   // the first call only starts the clock
++        last_time = cur_time;
++        last_pts = pts;
++        return;
++    }
++    run_time = cur_time - last_time;
++    if (run_time <= 0)
++        return;
++    last_time = cur_time;
++
++    secs = pts / AV_TIME_BASE;
++    if (first_input && first_input->duration != AV_NOPTS_VALUE)
++        total_secs = first_input->duration / AV_TIME_BASE;
++
++    // speed as a multiple of real time over the last interval; time left smoothed over two intervals
++    speed = (float)(pts - last_pts) / (float)run_time;
++    remaining = speed > 0 ? (int)((total_secs - secs) / speed) : -1;
++    smoothed = last_remaining ? (int)(last_remaining * 0.5 + remaining * 0.5) : remaining;
++    if (smoothed < 0)
++        smoothed = -1;
++
++    snprintf(q, sizeof(q), "progress=%.1f&size=%lld&remaining=%d&speed=%.1f",
++             total_secs == 0 ? -1.0f : (float)secs * 100.0f / total_secs, (long long)total_size, smoothed, speed);
++    if (vdec_hw_status >= 0)
++        av_strlcatf(q, sizeof(q), "&vdec_hw_status=%d", vdec_hw_status);
++    put_query(q);
++
++    last_remaining = remaining;
++    last_pts = pts;
++}
+diff --git a/fftools/ffmpeg_report.h b/fftools/ffmpeg_report.h
+new file mode 100644
+index 0000000..d6d29fa
+--- /dev/null
++++ b/fftools/ffmpeg_report.h
+@@ -0,0 +1,45 @@
++/*
++ * Progress and log reporting to the media server that started this process.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef FFTOOLS_FFMPEG_REPORT_H
++#define FFTOOLS_FFMPEG_REPORT_H
++
++#include <stdint.h>
++
++#include "cmdutils.h"
++#include "libavformat/avformat.h"
++
++/*
++ * -progressurl <url>: HTTP PUTs to <url>/stream?..., <url>/streamDetail?... (each input stream), <url>?duration=...
++ *                     and every stats period <url>?progress=...&size=...&remaining=...&speed=...[&vdec_hw_status=...]
++ * -loglevel_server <level>: log lines at or above <level> are also POSTed to <url>/log?level=&message=
++ * Both are read before the other options, so the server hears about the startup.
++ */
++void report_init(int argc, char **argv, const OptionDef *options);
++int  report_opt_noop(void *optctx, const char *opt, const char *arg);
++int  report_enabled(void);
++
++void report_duration(const AVFormatContext *ic);
++void report_input_streams(const AVFormatContext *ic);
++/* called from print_report(); pts is the output position in AV_TIME_BASE units */
++void report_progress(int64_t pts, int64_t total_size, int64_t cur_time, const AVFormatContext *first_input,
++                     int vdec_hw_status);
++
++#endif /* FFTOOLS_FFMPEG_REPORT_H */
